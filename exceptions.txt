@@ -1,0 +1,70 @@
+# OCR exception list
+#
+# Lines with format:  iTrade-<SKU>:"<ocr text>":<confidence 0-1>
+# Populated by the pipeline for any file where OCR ran but no keyword
+# matched (so the file went through without inpainting). The pipeline
+# appends a line per detection, not just per file.
+#
+# Workflow:
+#   1. Pipeline runs, masked files go to ./output/, unmatched go here.
+#   2. Review the list, decide: add a new keyword to STAGE_OCR_KEYWORDS
+#      that catches the pattern, OR add a manual mask/patch for the
+#      specific filename.
+#
+# Lines starting with # are comments.
+
+iTrade-00205:"SEIRO":0.4
+iTrade-00207:"SEIKO":0.3
+iTrade-00211:"S2IKO":0.2
+iTrade-00302:"EEIO":0.3
+iTrade-00402:"'EIO":0.5
+iTrade-00207:"SBTKO":0.2
+iTrade-00211:"SELO":0.7
+iTrade-00402:"SEIEO":0.4
+iTrade-01402:"SPIKO":0.4
+iTrade-01408:"SEKO":0.9
+iTrade-00607:"ovsTER PE RPETUAL":0.2
+iTrade-00607:"DAY- 0 ATE":0.3
+iTrade-00716:"sa.KO":0.05
+iTrade-00717:"OYSTer PERPETUAL":0.3
+iTrade-00717:"DAtejust":0.5
+iTrade-00717:"Se":0.7
+iTrade-00719:"ZxkSo":0.04
+iTrade-00805:"SEIKa":0.3
+iTrade-00815:"SEIKO":0.5
+iTrade-00816:"SEEO":0.9
+iTrade-00816:"STER PErPETuAL":0.2
+iTrade-00816:"DATEJUST":0.4
+iTrade-00901:"OysTeR PERPETUAL":0.3
+iTrade-00901:"OATeJust":0.2
+iTrade-01105:"ERPETUAL 0d":0.8
+iTrade-01105:"SUBMARINVER":0.8
+iTrade-01107:"VarcR PERPETUAL OATE":0.1
+iTrade-01301:"EBIKO":0.2
+iTrade-01301:"cP PERPETUAL OATE":0.4
+iTrade-01302:"OYSTER PER":0.7
+iTrade-01302:"YACHT-A ASTER":0.2
+iTrade-01303:"JYSTER PeR #ETUAL DATS":0.08
+iTrade-00105:"SEIKO":0.5
+iTrade-00513:"BEIKO":0.1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,45 @@
+name: watch-pipeline
+
+services:
+  pipeline:
+    # Build the image from the local Dockerfile. `image:` pins the tag so
+    # `docker compose run` can reference it without rebuilding every time.
+    build: .
+    image: watch-pipeline:latest
+    container_name: watch-pipeline
+    restart: "no"
+
+    # Modern Compose (v2.20+): the deploy stanza auto-translates to --gpus on
+    # the underlying `docker run`. Replace with `runtime: nvidia` for older
+    # Compose (<2.20) if the deploy stanza is rejected as unknown.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, compute, utility]
+    # runtime: nvidia
+
+    environment:
+      # All AI model weights are pre-baked into the image at build time;
+      # no volumes or external caches are needed.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      WATCH_INPUT_DIR: /data/in
+      WATCH_OUTPUT_DIR: /data/out
+      # Reduces CUDA memory fragmentation -- prevents OOM on long batches.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+    volumes:
+      # Mount project root as input (read-only); ./output as the result dir.
+      - ./:/data/in:ro
+      - ./output:/data/out
+      # Live-reload: bind-mount the Python scripts into /app so edits
+      # on the host take effect on the next `docker compose run` without
+      # needing a rebuild. Read-only so the container can't write them.
+      - ./process_images.py:/app/process_images.py:ro
+      - ./shopify_auth.py:/app/shopify_auth.py:ro
+      # update_stock.py is missing from the repo — re-add this line once
+      # the file is restored:
+      # - ./update_stock.py:/app/update_stock.py:ro

@@ -1,0 +1,24 @@
+# Generated outputs
+/output/
+
+# AI pipeline intermediates (created at runtime)
+/.cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editors
+.vscode/
+.idea/
+
+# Secrets — Shopify Admin API token. Use env var instead.
+/.shopify_config.json
+
+# User-local env overrides (copy example.env → .env if you want)
+/.env
+
+# OS
+.DS_Store
+Thumbs.db
