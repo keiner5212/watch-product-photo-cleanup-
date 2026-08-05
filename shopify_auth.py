@@ -35,6 +35,7 @@ Usage
 """
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -45,7 +46,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 STORE = "axuzmh-jz.myshopify.com"
 API_VERSION = "2026-07"
 SCRIPT_DIR = Path(__file__).parent
-OUTPUT_DIR = SCRIPT_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("WATCH_OUTPUT_DIR", SCRIPT_DIR / "output")).resolve()
 SHOPIFY_ACCESS_TOKEN = ""
 GRAPHQL_URL = f"https://{STORE}/admin/api/{API_VERSION}/graphql.json"
 STAGED_UPLOAD_HOST = "shopify-staged-uploads.storage.googleapis.com"
