@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Watch image cleanup pipeline for Shopify.
+"""Watch image cleanup pipeline for Shopify (AI stages only).
 
 Pipeline (per batch, one model at a time):
-  upscale -> inpaint (OCR + LaMa) -> bg-cut (BiRefNet) -> finalize
-Each stage writes under OUTPUT_DIR/.cache/<stage>/ and skips hits.
+  upscale -> inpaint (OCR + LaMa) -> bg-cut (BiRefNet)
+Reads watches from INPUT_DIR, writes transparent cutouts to OUTPUT_DIR.
+The intermediate upscale + inpaint caches live under OUTPUT_DIR/.cache/
+for resume-safe re-runs. Geometric normalization (crop/scale/compose) is
+handled by the standalone normalize_watches.py script.
 """
 import gc
 import os
@@ -61,27 +64,12 @@ except ImportError:
 
 INPUT_DIR = Path(os.environ.get("WATCH_INPUT_DIR", Path(__file__).parent)).resolve()
 OUTPUT_DIR = Path(os.environ.get("WATCH_OUTPUT_DIR", Path(__file__).parent / "output")).resolve()
-TARGET_SIZE = 1200
-PADDING = 80
-BACKGROUND = None
-OUTPUT_FORMAT = "PNG"
-JPEG_QUALITY = 95
-JPEG_SUBSAMPLING = 0
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 IMAGE_LIMIT = None
 
 ALPHA_THRESHOLD = 128
 ALPHA_DILATE_SIZE = 5
 ALPHA_SMOOTH_RADIUS = 1.2
-
-SHARPEN_RADIUS = 1.5
-SHARPEN_PERCENT = 120
-SHARPEN_THRESHOLD = 2
-
-SCALE_UP_FILTER = Image.LANCZOS
-SCALE_DOWN_FILTER = Image.BOX
-TWO_PASS_THRESHOLD = 0.5
-PRESCALE_SHARPEN_PERCENT = 20
 
 NO_BG_THRESHOLD = 0.05
 
@@ -110,7 +98,6 @@ STAGE_SD_SEED = 42
 
 CACHE_UPSCALE = OUTPUT_DIR / ".cache" / "02_upscale"
 CACHE_INPAINT = OUTPUT_DIR / ".cache" / "03_inpaint"
-CACHE_BG = OUTPUT_DIR / ".cache" / "04_bg"
 SKIP_DIR_NAMES = frozenset({"output", ".cache"})
 
 
@@ -203,6 +190,26 @@ def _same_dir(a: Path, b: Path) -> bool:
         return False
 
 
+def _clean_output_dir(out: Path) -> int:
+    """Empty OUT, preserving hidden subdirs (e.g. .cache/ for resume state).
+    Returns count of removed entries."""
+    if not out.exists():
+        out.mkdir(parents=True, exist_ok=True)
+        return 0
+    removed = 0
+    for entry in out.iterdir():
+        if entry.name.startswith("."):
+            continue
+        if entry.is_file() or entry.is_symlink():
+            entry.unlink()
+            removed += 1
+        else:
+            import shutil as _sh
+            _sh.rmtree(entry)
+            removed += 1
+    return removed
+
+
 def _should_skip_input(path: Path, input_root: Path) -> bool:
     """Skip output/.cache even when docker mounts project root as /data/in."""
     resolved = path.resolve()
@@ -239,73 +246,6 @@ def has_no_background(image, threshold=NO_BG_THRESHOLD):
         return False
     alpha = np.array(image.split()[-1])
     return (alpha < 10).sum() / alpha.size > threshold
-
-
-def symmetric_crop(cutout):
-    bbox = cutout.split()[-1].getbbox()
-    if not bbox:
-        return None
-    left, top, right, bottom = bbox
-    cx = (left + right) // 2
-    cy = (top + bottom) // 2
-    side = max(right - left, bottom - top)
-    half = side // 2
-    crop_left = max(0, cx - half)
-    crop_top = max(0, cy - half)
-    crop_right = min(cutout.width, crop_left + side)
-    crop_bottom = min(cutout.height, crop_top + side)
-    if crop_right - crop_left < side:
-        crop_left = max(0, crop_right - side)
-    if crop_bottom - crop_top < side:
-        crop_top = max(0, crop_bottom - side)
-    return cutout.crop((crop_left, crop_top, crop_right, crop_bottom))
-
-
-def scale_watch(watch, target_size, padding):
-    avail = target_size - 2 * padding
-    orig_w, orig_h = watch.width, watch.height
-    side = max(orig_w, orig_h)
-    scale = avail / side
-    if scale == 1.0:
-        return watch
-    final_size = (
-        max(1, int(orig_w * scale)),
-        max(1, int(orig_h * scale)),
-    )
-    if scale > 1.0:
-        return watch.resize(final_size, SCALE_UP_FILTER)
-    if PRESCALE_SHARPEN_PERCENT > 0 and watch.mode == "RGBA":
-        r, g, b, a = watch.split()
-        rgb = Image.merge("RGB", (r, g, b)).filter(
-            ImageFilter.UnsharpMask(radius=1.0, percent=PRESCALE_SHARPEN_PERCENT, threshold=2)
-        )
-        watch = Image.merge("RGBA", (*rgb.split(), a))
-    if scale < TWO_PASS_THRESHOLD:
-        mid_size = (
-            max(1, int(orig_w * TWO_PASS_THRESHOLD)),
-            max(1, int(orig_h * TWO_PASS_THRESHOLD)),
-        )
-        watch = watch.resize(mid_size, SCALE_DOWN_FILTER)
-    return watch.resize(final_size, SCALE_DOWN_FILTER)
-
-
-def sharpen_watch(watch):
-    if SHARPEN_PERCENT <= 0 or watch.mode != "RGBA":
-        return watch
-    r, g, b, a = watch.split()
-    rgb = Image.merge("RGB", (r, g, b)).filter(
-        ImageFilter.UnsharpMask(SHARPEN_RADIUS, SHARPEN_PERCENT, SHARPEN_THRESHOLD)
-    )
-    return Image.merge("RGBA", (*rgb.split(), a))
-
-
-def compose_canvas(watch, target_size, background):
-    bg = (0, 0, 0, 0) if background is None else background
-    canvas = Image.new("RGBA", (target_size, target_size), bg)
-    x = (target_size - watch.width) // 2
-    y = (target_size - watch.height) // 2
-    canvas.paste(watch, (x, y), watch)
-    return canvas
 
 
 _REALESRGAN_URL_BASE = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1"
@@ -694,16 +634,17 @@ def _get_bg_session():
 
 
 def _stage_bg(jobs):
-    """BiRefNet only. Cache -> .cache/04_bg. Unload before return."""
-    CACHE_BG.mkdir(parents=True, exist_ok=True)
+    """BiRefNet. Writes transparent watch cutouts straight to OUTPUT_DIR.
+    Skips when output exists with non-zero size. Unloads model before return."""
     pending = []
     for job in jobs:
-        out_path = _cache_path(CACHE_BG, job.rel)
-        if _use_cache_hit(job, out_path):
+        out_path = OUTPUT_DIR / job.rel
+        if out_path.is_file() and out_path.stat().st_size > 0:
+            job.current = out_path
             continue
         pending.append((job, out_path))
     if not pending:
-        print(f"  bg: all {len(jobs)} cached", flush=True)
+        print(f"  bg: all {len(jobs)} already done", flush=True)
         return 0
 
     if not STAGE_BG_ENABLED:
@@ -731,43 +672,6 @@ def _stage_bg(jobs):
     return done
 
 
-def _save(canvas, out_path):
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fmt = OUTPUT_FORMAT.upper()
-    if fmt == "JPEG":
-        canvas.convert("RGB").save(
-            out_path, "JPEG",
-            quality=JPEG_QUALITY, subsampling=JPEG_SUBSAMPLING,
-        )
-    elif fmt == "PNG":
-        canvas.save(out_path, "PNG", optimize=True)
-    else:
-        canvas.save(out_path, fmt)
-
-
-def _stage_finalize(jobs):
-    """No AI. Crop -> scale -> sharpen -> compose -> OUTPUT_DIR."""
-    counts = {"saved": 0, "skipped": 0}
-    for job in jobs:
-        out = OUTPUT_DIR / job.rel.with_suffix("." + OUTPUT_FORMAT.lower())
-        if out.is_file() and out.stat().st_size > 0:
-            counts["saved"] += 1
-            continue
-        cutout = _open_with_exif(job.current).convert("RGBA")
-        watch = symmetric_crop(cutout)
-        if watch is None:
-            print(f"  skip {job.rel}: empty content")
-            counts["skipped"] += 1
-            continue
-        watch = scale_watch(watch, TARGET_SIZE, PADDING)
-        watch = sharpen_watch(watch)
-        canvas = compose_canvas(watch, TARGET_SIZE, BACKGROUND)
-        _save(canvas, out)
-        counts["saved"] += 1
-        print(f"  final {job.rel}", flush=True)
-    return counts
-
-
 def collect_images(root):
     root = root.resolve()
     images = sorted(
@@ -788,6 +692,10 @@ def main():
     if _same_dir(INPUT_DIR, OUTPUT_DIR):
         sys.exit(f"input and output dirs must differ: {INPUT_DIR}")
 
+    n = _clean_output_dir(OUTPUT_DIR)
+    if n:
+        print(f"  cleared {n} stale entries in {OUTPUT_DIR} (preserved hidden dirs)", flush=True)
+
     paths = collect_images(INPUT_DIR)
     if not paths:
         sys.exit(f"no images found under {INPUT_DIR}")
@@ -798,16 +706,12 @@ def main():
 
     print(f"processing {len(jobs)} images from {INPUT_DIR}")
     print(
-        f"  target: {TARGET_SIZE}x{TARGET_SIZE}, padding: {PADDING}, "
-        f"bg: {'transparent' if BACKGROUND is None else BACKGROUND}"
-    )
-    print(
         f"  pipeline (one model at a time, cached):\n"
         f"    1 upscale  : {STAGE_UPSCALE_ENABLED} ({STAGE_UPSCALE_MODEL} x{STAGE_UPSCALE_OUTSCALE})\n"
         f"    2 inpaint  : {STAGE_INPAINT_ENABLED} "
         f"({STAGE_INPAINT_MODEL}; OCR '{STAGE_OCR_LANG}' conf>={STAGE_OCR_CONFIDENCE})\n"
         f"    3 bg-cut   : {STAGE_BG_ENABLED} ({STAGE_BG_MODEL})\n"
-        f"    4 finalize : crop -> scale -> sharpen -> compose -> {OUTPUT_FORMAT}"
+        f"  geometric normalization (crop/scale/compose) lives in normalize_watches.py"
     )
 
     try:
@@ -818,15 +722,13 @@ def main():
         print(f"  inpaint done ({n} inpainted) -> {CACHE_INPAINT}", flush=True)
 
         n = _stage_bg(jobs)
-        print(f"  bg done ({n} new) -> {CACHE_BG}", flush=True)
-
-        counts = _stage_finalize(jobs)
+        print(f"  bg done ({n} new) -> {OUTPUT_DIR}", flush=True)
     finally:
         _drop_all_models()
 
     print(
-        f"done. {counts['saved']}/{len(jobs)} saved to {OUTPUT_DIR}  |  "
-        f"skipped (empty): {counts['skipped']}"
+        f"done. {n} transparent watches saved to {OUTPUT_DIR}  |  "
+        f"chain: run normalize_watches.py for the final canvas"
     )
 
 

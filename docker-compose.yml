@@ -39,7 +39,9 @@ services:
       # on the host take effect on the next `docker compose run` without
       # needing a rebuild. Read-only so the container can't write them.
       - ./process_images.py:/app/process_images.py:ro
+      - ./normalize_watches.py:/app/normalize_watches.py:ro
       - ./remove_magenta.py:/app/remove_magenta.py:ro
+      - ./approve_output.py:/app/approve_output.py:ro
       - ./shopify_auth.py:/app/shopify_auth.py:ro
       # update_stock.py is missing from the repo — re-add this line once
       # the file is restored:

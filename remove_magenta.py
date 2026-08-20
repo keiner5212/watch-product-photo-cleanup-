@@ -16,6 +16,7 @@ Reuses LaMa from simple_lama_inpainting (pre-baked in the docker image).
 """
 import gc
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -155,6 +156,25 @@ def _should_skip_input(path: Path, input_root: Path) -> bool:
     except ValueError:
         return True
     return bool(rel.parts) and rel.parts[0] in SKIP_DIR_NAMES
+
+
+def _clean_output_dir(out: Path) -> int:
+    """Empty OUT, preserving hidden subdirs (e.g. .cache/ for resume state).
+    Returns count of removed entries."""
+    if not out.exists():
+        out.mkdir(parents=True, exist_ok=True)
+        return 0
+    removed = 0
+    for entry in out.iterdir():
+        if entry.name.startswith("."):
+            continue
+        if entry.is_file() or entry.is_symlink():
+            entry.unlink()
+            removed += 1
+        else:
+            shutil.rmtree(entry)
+            removed += 1
+    return removed
 
 
 def _get_lama():
@@ -300,6 +320,10 @@ def main():
         sys.exit(f"input dir missing: {INPUT_DIR}")
     if _same_dir(INPUT_DIR, OUTPUT_DIR):
         sys.exit(f"input and output dirs must differ: {INPUT_DIR}")
+
+    n = _clean_output_dir(OUTPUT_DIR)
+    if n:
+        print(f"  cleared {n} stale entries in {OUTPUT_DIR} (preserved hidden dirs)", flush=True)
 
     paths = collect_images(INPUT_DIR)
     if not paths:

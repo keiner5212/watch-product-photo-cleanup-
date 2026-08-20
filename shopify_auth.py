@@ -19,8 +19,10 @@ Prerequisites
 Expected image format
 ---------------------
 - File naming:  iTrade-<SKU>.png   (e.g. iTrade-00507.png)
-- Location:    ./output/<BrandFolder>/iTrade-<SKU>.png  (produced by
-               process_images.py)
+- Location:    ./output/<BrandFolder>/iTrade-<SKU>.png  (last script's
+               output, typically normalize_watches.py -> 1200x1200).
+               Override with WATCH_OUTPUT_DIR when running outside the
+               default docker compose mount.
 - Format:      PNG, transparent background (BGRA)
 - Size:        up to 20 MB per file (Shopify hard limit, see
                MAX_IMAGE_BYTES); output is 1200x1200 so typical
