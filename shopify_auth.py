@@ -14,7 +14,9 @@ Prerequisites
    (typically ~/.config/shopify/<store>.json on Linux). The token
    below is the one currently in the CLI config; re-running the
    `shopify store auth` command above prints + saves a new one --
-   paste the new value into SHOPIFY_ACCESS_TOKEN below.
+   paste the new value into SHOPIFY_ACCESS_TOKEN below. To inspect
+   the current token:
+       cat ~/.config/shopify/axuzmh-jz.myshopify.com.json
 
 Expected image format
 ---------------------
