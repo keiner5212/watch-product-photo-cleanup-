@@ -193,9 +193,8 @@ associates each one with its variant.
 shopify store auth --store axuzmh-jz.myshopify.com \
     --scopes "read_products,write_products,read_inventory,write_inventory,read_locations"
 
-# After auth, the CLI saves the access token to a per-store config file
-# (Linux: ~/.config/shopify/<store>.json). Read it with cat:
-cat ~/.config/shopify/axuzmh-jz.myshopify.com.json
+# After auth, the CLI saves the access token to a per-store config file:
+cat ~/.config/shopify-cli-store-nodejs/config.json
 
 # Dry run: print matches only
 docker compose run --rm pipeline shopify_auth.py --dry-run

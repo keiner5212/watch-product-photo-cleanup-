@@ -11,12 +11,12 @@ Prerequisites
            --scopes "read_products,write_products,read_inventory,write_inventory,read_locations"
 
 3. The CLI stores the access token in a per-store config file
-   (typically ~/.config/shopify/<store>.json on Linux). The token
-   below is the one currently in the CLI config; re-running the
-   `shopify store auth` command above prints + saves a new one --
+   (typically ~/.config/shopify-cli-store-nodejs/config.json on Linux).
+   The token below is the one currently in the CLI config; re-running
+   the `shopify store auth` command above prints + saves a new one --
    paste the new value into SHOPIFY_ACCESS_TOKEN below. To inspect
    the current token:
-       cat ~/.config/shopify/axuzmh-jz.myshopify.com.json
+       cat ~/.config/shopify-cli-store-nodejs/config.json
 
 Expected image format
 ---------------------
