@@ -43,6 +43,7 @@ services:
       - ./remove_magenta.py:/app/remove_magenta.py:ro
       - ./approve_output.py:/app/approve_output.py:ro
       - ./shopify_auth.py:/app/shopify_auth.py:ro
+      - ./shopify_metafields.py:/app/shopify_metafields.py:ro
       # update_stock.py is missing from the repo — re-add this line once
       # the file is restored:
       # - ./update_stock.py:/app/update_stock.py:ro
