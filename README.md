@@ -55,10 +55,11 @@ BiRefNet (`birefnet-general`) writes a soft alpha matte. The matte is what
 keeps the edges clean: no halo, no fringe, no hard cut. The transition band
 of the matte is then tightened so the edge stays crisp at 1200 px.
 
-BiRefNet needs about 6 GB of VRAM, which is more than a 6 GB card has left
-once the upscaler is loaded. The pipeline therefore runs the matte on the GPU
-when there is room and falls back to the CPU automatically when the GPU
-cannot hold it (about 20 s per image on the CPU).
+The matte is PyTorch BiRefNet general at float16, CUDA only. There is no
+CPU device and no CPU retry. The ONNX export of the same model asks for a
+784 MB decoder buffer when this 6 GB card has about 600 MB free, so that
+export is not used. Float16 inference peaks near 2 GB. The matte runs
+before the upscaler is loaded so the two models never share VRAM.
 
 Internally the matte is computed first and cached as an alpha PNG under
 `./output/.cache/matte/`, then the cutout is upscaled. That keeps the two GPU

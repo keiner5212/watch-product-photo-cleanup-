@@ -53,6 +53,10 @@ UPSCALE_WEIGHTS = Path(
 )
 
 MATTE_MODEL = os.environ.get("STAGE_BG_MODEL", "birefnet-general")
+MATTE_REPO = "ZhengPeng7/BiRefNet"
+MATTE_REVISION = os.environ.get(
+    "MATTE_REVISION", "e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4"
+)
 ALPHA_LOW = int(os.environ.get("ALPHA_LOW", 64))
 ALPHA_HIGH = int(os.environ.get("ALPHA_HIGH", 192))
 
@@ -74,16 +78,6 @@ class PipelineError(RuntimeError):
 def safe(text):
     """Strip control characters from store and file names before printing."""
     return re.sub(r"[\x00-\x1f\x7f-\x9f]", "?", str(text))
-
-
-def gpu_available():
-    """True when the container can see an NVIDIA GPU."""
-    try:
-        import torch
-
-        return torch.cuda.is_available()
-    except Exception:
-        return False
 
 
 @dataclass
@@ -287,34 +281,47 @@ class Upscaler:
 
 
 class MatteRemover:
-    """BiRefNet background removal."""
-
-    gpu_usable = True
+    """BiRefNet background removal. CUDA fp16 only."""
 
     def __init__(self, model=MATTE_MODEL):
-        from rembg import new_session
+        import torch
+        from torchvision import transforms
+        from transformers import AutoModelForImageSegmentation
 
-        self._model = model
-        self._new_session = new_session
-        self._session = None
-        self.device = "none"
-        providers = ["CPUExecutionProvider"]
-        if gpu_available() and self.gpu_usable:
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        self._open(providers)
-
-    def _open(self, providers):
-        self._session = self._new_session(self._model, providers=providers)
-        inner = getattr(self._session, "inner_session", None)
-        active = list(inner.get_providers()) if inner is not None else []
-        self.device = active[0] if active else "unknown"
+        if model != "birefnet-general":
+            raise PipelineError(f"unsupported matte model: {model}")
+        if not torch.cuda.is_available():
+            raise PipelineError("matte needs a CUDA GPU")
+        network = AutoModelForImageSegmentation.from_pretrained(
+            MATTE_REPO,
+            revision=MATTE_REVISION,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        network.eval()
+        network.to("cuda")
+        network.half()
+        self._torch = torch
+        self._network = network
+        self._transform = transforms.Compose([
+            transforms.Resize((1024, 1024)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+        self._to_image = transforms.ToPILImage()
+        self.device = "cuda"
 
     def _run(self, image):
-        from rembg import remove
-
-        mask = remove(
-            flatten_on_white(image), session=self._session, only_mask=True
-        ).convert("L")
+        torch = self._torch
+        rgb = flatten_on_white(image)
+        batch = self._transform(rgb).unsqueeze(0).to(device="cuda", dtype=torch.float16)
+        with torch.inference_mode():
+            pred = self._network(batch)[-1].sigmoid()[0, 0].float()
+        low = float(pred.min())
+        high = float(pred.max())
+        if high > low:
+            pred = (pred - low) / (high - low)
+        mask = self._to_image(pred.cpu()).resize(image.size, Image.Resampling.LANCZOS)
         values = np.asarray(mask, dtype=np.int32)
         span = max(ALPHA_HIGH - ALPHA_LOW, 1)
         tightened = np.clip((values - ALPHA_LOW) * 255 // span, 0, 255).astype(np.uint8)
@@ -322,22 +329,14 @@ class MatteRemover:
 
     def alpha(self, image: Image.Image) -> Image.Image:
         """Return the alpha matte of the subject, tightened for crisp edges."""
-        try:
-            return self._run(image)
-        except Exception as error:
-            if not self.device.startswith("CUDA"):
-                raise
-            print(
-                f"  GPU matte failed ({type(error).__name__}), retrying on CPU",
-                flush=True,
-            )
-            MatteRemover.gpu_usable = False
-            self._open(["CPUExecutionProvider"])
-            return self._run(image)
+        return self._run(image)
 
     def release(self):
-        del self._session
+        torch = self._torch
+        del self._network
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def subject_mask(cutout: Image.Image) -> Image.Image:

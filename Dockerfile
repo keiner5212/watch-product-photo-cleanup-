@@ -32,8 +32,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 WORKDIR /app
 
-# onnxruntime-gpu ships both the CUDA and the CPU execution provider, so the
-# pipeline still runs (slower) when no GPU is visible to the container.
 # rembg pulls the CPU-only onnxruntime wheel, so it is removed before the GPU
 # wheel is installed to keep one single onnxruntime package on the image.
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
@@ -92,19 +90,26 @@ RUN SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
     "$SITE/basicsr/data/degradations.py"
 
 # Pre-bake model weights into the image filesystem, checksummed.
-RUN mkdir -p /root/.cache/realesrgan /root/.u2net && \
+RUN mkdir -p /root/.cache/realesrgan && \
     curl -fsSL -o /root/.cache/realesrgan/RealESRGAN_x2plus.pth \
     https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth && \
     echo "49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb  /root/.cache/realesrgan/RealESRGAN_x2plus.pth" \
-    | sha256sum -c - && \
-    curl -fsSL -o /root/.u2net/birefnet-general.onnx \
-    https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-epoch_244.onnx && \
-    echo "58f621f00f5d756097615970a88a791584600dcf7c45b18a0a6267535a1ebd3c  /root/.u2net/birefnet-general.onnx" \
     | sha256sum -c -
 
-# The CUDA execution provider crashes when no GPU is visible, so the pre-bake
-# session is built on the CPU provider.
-RUN python3 -c "import rembg; rembg.new_session('birefnet-general', providers=['CPUExecutionProvider']); print('pre-bake ok')"
+# PyTorch BiRefNet general, fp16, CUDA only at runtime. The ONNX export does
+# not fit this 6 GB card. Revision must match MATTE_REVISION in pipeline.py.
+ENV MATTE_REVISION=e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install --no-cache-dir \
+    "transformers==4.46.3" \
+    "huggingface_hub==0.36.2" \
+    "timm==1.0.31" \
+    "kornia==0.9.2" \
+    "einops==0.8.2" && \
+    python3 -c "import torch; assert torch.__version__.startswith('2.7.0'), torch.__version__"
+RUN python3 -c "import os; from huggingface_hub import snapshot_download; from transformers import AutoModelForImageSegmentation; revision=os.environ['MATTE_REVISION']; snapshot_download('ZhengPeng7/BiRefNet', revision=revision); AutoModelForImageSegmentation.from_pretrained('ZhengPeng7/BiRefNet', revision=revision, trust_remote_code=True)"
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 COPY *.py ./
 
