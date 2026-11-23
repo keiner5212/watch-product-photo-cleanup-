@@ -23,7 +23,7 @@ result to Shopify, replacing the image of every variant it matches.
                                                                      v
 +---------------------------+     +--------------------+     +------------------+
 |  4 Shopify                | <-- |  3 normalize       | <-- |  2 background     |
-|  product variant images   |     |  1600x1600 WEBP    |     |  BiRefNet matte   |
+|  product variant images   |     |  1200x1200 WEBP    |     |  BiRefNet matte   |
 |  (replaced per SKU)       |     |  transparent, even |     |                  |
 +---------------------------+     |  margin            |     +------------------+
                                   +--------------------+
@@ -44,14 +44,16 @@ Both lists are printed before the run ends, so nothing is uploaded half done.
 
 ### 1 Upscale
 
-Real-ESRGAN x2 on the GPU. The extra resolution is what the final canvas is
-built on.
+Real-ESRGAN x2plus on the GPU. The frame is cut into 256 px tiles with a
+10 px overlap so the model fits in 6 GB. If a tile still runs out of VRAM
+the tile is halved down to 128 px and that image is retried on the GPU.
+The extra resolution is what the final canvas is built on.
 
 ### 2 Background removal
 
 BiRefNet (`birefnet-general`) writes a soft alpha matte. The matte is what
 keeps the edges clean: no halo, no fringe, no hard cut. The transition band
-of the matte is then tightened so the edge stays crisp at 1600 px.
+of the matte is then tightened so the edge stays crisp at 1200 px.
 
 BiRefNet needs about 6 GB of VRAM, which is more than a 6 GB card has left
 once the upscaler is loaded. The pipeline therefore runs the matte on the GPU
@@ -70,7 +72,7 @@ what keeps the gallery steady when the customer clicks through it:
 1. measure the watch on its own alpha mask
 2. crop a square centred on that mask
 3. scale it so its longest side always spans the same usable area
-4. centre it on a 1600x1600 transparent canvas
+4. centre it on a 1200x1200 transparent canvas
 
 The margin is therefore identical on all four sides of every image, and the
 subject keeps the same size and the same position from one photo to the next.
@@ -150,10 +152,10 @@ Every knob is an environment variable set in `docker-compose.yml`.
 
 | Variable | Default | What it controls |
 |---|---|---|
-| `CANVAS_SIZE` | `1600` | Final square canvas edge length |
+| `CANVAS_SIZE` | `1200` | Final square canvas edge length |
 | `PADDING_RATIO` | `0.08` | Empty margin as a share of the canvas |
 | `UPSCALE_SCALE` | `2` | Real-ESRGAN factor |
-| `UPSCALE_TILE` | `512` | Tile size for VRAM control (0 = no tiling, OOM prone) |
+| `UPSCALE_TILE` | `256` | Input tile in px. Halves down to 128 on GPU OOM. 0 tries the whole frame first |
 | `STAGE_BG_MODEL` | `birefnet-general` | rembg session name (`birefnet-general-lite` runs on the GPU) |
 | `ALPHA_LOW` | `64` | Alpha below this counts as background |
 | `ALPHA_HIGH` | `192` | Alpha above this counts as subject, the band in between is the soft edge |

@@ -6,7 +6,7 @@
 Stages
 ------
 0.5  preflight   count Shopify products against local images, stop on any gap
-1    upscale     Real-ESRGAN x2 on the GPU
+1    upscale     Real-ESRGAN x2plus on the GPU, tiled
 2    matte       BiRefNet background removal, transparent cutout
 3    normalize   square canvas, uniform margin, WEBP with alpha
 4    publish     upload to Shopify, replacing the media of the matching SKU
@@ -41,12 +41,13 @@ from shopify_api import ShopifyError
 INPUT_DIR = Path(os.environ.get("WATCH_INPUT_DIR", Path(__file__).parent)).resolve()
 OUTPUT_DIR = Path(os.environ.get("WATCH_OUTPUT_DIR", Path(__file__).parent / "output")).resolve()
 
-CANVAS_SIZE = int(os.environ.get("CANVAS_SIZE", 1600))
+CANVAS_SIZE = int(os.environ.get("CANVAS_SIZE", 1200))
 PADDING_RATIO = float(os.environ.get("PADDING_RATIO", 0.08))
 PADDING = round(CANVAS_SIZE * PADDING_RATIO)
 
 UPSCALE_SCALE = int(os.environ.get("UPSCALE_SCALE", 2))
-UPSCALE_TILE = int(os.environ.get("UPSCALE_TILE", 512))
+UPSCALE_TILE = int(os.environ.get("UPSCALE_TILE", 256))
+UPSCALE_TILE_MIN = 128
 UPSCALE_WEIGHTS = Path(
     os.environ.get("UPSCALE_WEIGHTS", "/root/.cache/realesrgan/RealESRGAN_x2plus.pth")
 )
@@ -139,13 +140,15 @@ def collect_local_images(input_dir: Path = INPUT_DIR) -> dict:
 
 
 class Upscaler:
-    """Real-ESRGAN super resolution on the GPU."""
+    """Real-ESRGAN x2plus on the GPU, one tile at a time."""
 
     def __init__(self, scale=UPSCALE_SCALE, tile=UPSCALE_TILE):
         import torch
         from basicsr.archs.rrdbnet_arch import RRDBNet
         from realesrgan import RealESRGANer
 
+        if not torch.cuda.is_available():
+            raise PipelineError("upscale needs a CUDA GPU")
         if not UPSCALE_WEIGHTS.is_file():
             raise PipelineError(f"missing upscale weights: {UPSCALE_WEIGHTS}")
 
@@ -157,7 +160,6 @@ class Upscaler:
             num_grow_ch=32,
             scale=scale,
         )
-        on_gpu = torch.cuda.is_available()
         self._model = RealESRGANer(
             scale=scale,
             model_path=str(UPSCALE_WEIGHTS),
@@ -165,17 +167,112 @@ class Upscaler:
             tile=tile,
             tile_pad=10,
             pre_pad=0,
-            half=on_gpu,
-            gpu_id=0 if on_gpu else None,
+            half=True,
+            device=torch.device("cuda"),
         )
-        self.device = "cuda" if on_gpu else "cpu"
+        self.device = "cuda"
+
+    @property
+    def tile(self):
+        return self._model.tile_size
 
     def upscale(self, image: Image.Image) -> Image.Image:
+        import torch
+
         rgb = np.asarray(image.convert("RGB"))
-        bgr = rgb[..., ::-1].copy()
-        out_bgr, _ = self._model.enhance(bgr, outscale=UPSCALE_SCALE)
-        out_rgb = np.ascontiguousarray(out_bgr[..., ::-1])
-        return Image.fromarray(out_rgb, mode="RGB")
+        while True:
+            try:
+                out = self._upscale_tiles(rgb)
+                break
+            except RuntimeError as error:
+                if not self._is_oom(error):
+                    raise
+                if not self._shrink_tile():
+                    raise PipelineError(
+                        f"upscale out of GPU memory at tile {self.tile}"
+                    ) from error
+                gc.collect()
+                torch.cuda.empty_cache()
+                print(
+                    f"  upscale short on VRAM, tile -> {self.tile}",
+                    flush=True,
+                )
+        return Image.fromarray(out, mode="RGB")
+
+    def _shrink_tile(self):
+        current = self.tile
+        if 0 < current <= UPSCALE_TILE_MIN:
+            return False
+        self._model.tile_size = (
+            256 if current == 0 else max(UPSCALE_TILE_MIN, current // 2)
+        )
+        return True
+
+    @staticmethod
+    def _is_oom(error):
+        return (
+            type(error).__name__ == "OutOfMemoryError"
+            or "out of memory" in str(error).lower()
+        )
+
+    def _upscale_tiles(self, rgb):
+        # realesrgan catches OOM per tile and keeps going, so the tiles run here.
+        import torch
+        import torch.nn.functional as F
+
+        scale = self._model.scale
+        tile = self.tile
+        overlap = self._model.tile_pad
+        frame = torch.tensor(
+            np.transpose(rgb, (2, 0, 1)), device="cuda", dtype=torch.float16
+        ).unsqueeze(0).div_(255)
+        _, _, height, width = frame.shape
+        pad_h = (scale - height % scale) % scale
+        pad_w = (scale - width % scale) % scale
+        if pad_h or pad_w:
+            frame = F.pad(frame, (0, pad_w, 0, pad_h), mode="reflect")
+        _, _, padded_h, padded_w = frame.shape
+        canvas = np.empty((padded_h * scale, padded_w * scale, 3), dtype=np.uint8)
+        windows = self._windows(padded_h, padded_w, tile, overlap)
+        for top, left, bottom, right, y1, x1, y2, x2 in windows:
+            piece = frame[:, :, y1:y2, x1:x2].contiguous()
+            with torch.inference_mode():
+                pred = self._model.model(piece)
+            pred = pred[
+                :,
+                :,
+                (top - y1) * scale:(bottom - y1) * scale,
+                (left - x1) * scale:(right - x1) * scale,
+            ]
+            patch = (
+                pred.squeeze(0).float().clamp_(0, 1).mul_(255).round_().to(torch.uint8)
+            )
+            canvas[top * scale:bottom * scale, left * scale:right * scale] = (
+                patch.permute(1, 2, 0).cpu().numpy()
+            )
+            del pred, patch, piece
+        return np.ascontiguousarray(canvas[: height * scale, : width * scale])
+
+    @staticmethod
+    def _windows(height, width, tile, overlap):
+        if tile <= 0:
+            return [(0, 0, height, width, 0, 0, height, width)]
+        windows = []
+        for top in range(0, height, tile):
+            for left in range(0, width, tile):
+                bottom = min(top + tile, height)
+                right = min(left + tile, width)
+                windows.append((
+                    top,
+                    left,
+                    bottom,
+                    right,
+                    max(top - overlap, 0),
+                    max(left - overlap, 0),
+                    min(bottom + overlap, height),
+                    min(right + overlap, width),
+                ))
+        return windows
 
     def release(self):
         del self._model
@@ -397,7 +494,11 @@ def build_images(local_images, force=False, limit=0):
     build_mattes(local_images, pending, force)
 
     upscaler = Upscaler()
-    print(f"step 1  upscale (Real-ESRGAN x{UPSCALE_SCALE}, {upscaler.device})")
+    tile_label = upscaler.tile if upscaler.tile else "full"
+    print(
+        f"step 1  upscale (Real-ESRGAN x{UPSCALE_SCALE}, {upscaler.device}, "
+        f"tile {tile_label})"
+    )
     done = 0
     for image in pending:
         started = time.monotonic()
