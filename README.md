@@ -1,266 +1,188 @@
 # watch-product-photo-cleanup
 
-Automated pipeline that prepares watch product photos for Shopify: removes the
-brand text from the dial, removes the background, normalises size, and uploads
-to the matching product variant. Currently tuned for the SEIKO catalog (brand
-text removed via OCR + inpainting) but works for any brand -- just edit
-`STAGE_OCR_KEYWORDS` in `process_images.py`.
-
-## Pipeline
-
-Four standalone scripts, one shared output folder (`./output/`). Each script
-**empties `./output/` at startup** (preserving hidden subdirs like `.cache/`
-for resume state) so every run starts from a clean slate. After each run,
-review `./output/` and either approve the result or discard it.
-
-```
-+------------------+        +------------------+        +------------------+
-|  BrandFolder/    |  -->   |  process_images  |  -->   |  ./output/       |
-|  (raw inputs)    |        |  (AI stages)     |        |  (transparent)   |
-+------------------+        +------------------+        +------------------+
-                                                              |
-                                                  approve_output.py
-                                                              v
-                                                   BrandFolder/ (replaced)
-                                                              |
-+------------------+        +------------------+        +------------------+
-|  BrandFolder/    |  -->   |  remove_magenta  |  -->   |  ./output/       |
-|  (AI-cleaned,    |        |  (LaMa touch-up) |        |  (touched-up)    |
-|   marked #ff00bf)|        +------------------+        +------------------+
-+------------------+                                               |
-                                                          approve_output.py
-                                                                     v
-                                                      BrandFolder/ (replaced)
-                                                                     |
-+------------------+        +------------------+        +------------------+
-|  BrandFolder/    |  -->   | normalize_watches|  -->   |  ./output/       |
-|  (clean inputs)  |        |  (geometric,     |        |  (1200x1200      |
-|                  |        |   no AI)         |        |   canvases)      |
-+------------------+        +------------------+        +------------------+
-                                                                     |
-                                                       shopify_auth.py
-                                                                     v
-                                                            Shopify (uploaded)
-```
-
-### Pass 1 -- `process_images.py` (AI stages)
-
-For every image under `./<BrandFolder>/`:
-
-1. **Upscale** (`RealESRGAN_x2plus`) -- 2x resolution.
-2. **OCR + inpaint** (`EasyOCR` + `big-LaMa`) -- finds brand text on the dial via
-   CRAFT detection, inpaint it with surrounding dial texture.
-3. **Background cut** (`BiRefNet-general`) -- transparent background.
-
-Output lands at `./output/<BrandFolder>/iTrade-<SKU>.png` (transparent watch,
-variable size). The upscale and inpaint steps cache to
-`./output/.cache/02_upscale/` and `./output/.cache/03_inpaint/` (preserved
-across runs for resume).
-
-### Pass 2 -- `remove_magenta.py` (manual touch-up, optional)
-
-Pass 1's OCR can miss small marks (logos, model numbers, faint text) or marks
-that fall outside `STAGE_MASK_MAX_AREA_FRAC`. For those, paint the unwanted
-area in the final PNG with the exact colour **`#ff00bf`** (R=255, G=0, B=191)
-and run `remove_magenta.py`. It scans the tree, builds a tight mask from the
-magenta pixels (tolerance 60 + close + dilate + feather) and inpaints each
-masked region with `big-LaMa` so the dial texture is recreated.
-
-Output lands at `./output/<BrandFolder>/iTrade-<SKU>.png`.
-
-### Pass 3 -- `normalize_watches.py` (geometric normalization)
-
-Pure PIL. No AI. Reads watches from `WATCH_INPUT_DIR` and writes
-consistent-size, consistently-margined 1200x1200 square canvases to
-`./output/<BrandFolder>/iTrade-<SKU>.png`.
-
-For each image: alpha-threshold + dilate + blur to tighten the cutout,
-symmetric square crop around the watch bbox, scale to fit
-`TARGET_SIZE - 2*PADDING` (LANCZOS up, two-pass BOX down for >2x), compose
-centered on the canvas. Sharpening is off by default -- the watch pixels
-are not modified unless you set `SHARPEN_PERCENT > 0` at the top of the
-file.
-
-### `approve_output.py` (promote output to input)
-
-Moves every file in `./output/<BrandFolder>/<sku>.png` to
-`./<BrandFolder>/<sku>.png` (deleting the old input version first). This is
-the "I liked the output, push it back to the inputs" step. Run it after any
-of the passes above if you want to keep the result and feed it into the
-next pass.
+One command, all inside Docker: prepares watch product photos for Shopify and
+publishes them to the matching product variants.
 
 ```bash
-docker compose run --rm pipeline approve_output.py             # promote
-docker compose run --rm pipeline approve_output.py --dry-run   # show what would move
-docker compose run --rm pipeline approve_output.py --clear-after  # also clear ./output/
+docker compose run --rm pipeline
 ```
 
-Does NOT delete input files that have no matching output (orphans stay).
+That single run counts what the store expects against what is on disk, upscales
+every photo, removes the background, normalizes the framing, and uploads the
+result to Shopify, replacing the image of every variant it matches.
 
-## Workflow
+## Flow
 
-Typical end-to-end:
+```
++---------------------------+     +--------------------+     +------------------+
+|  <BrandFolder>/           | --> |  1 upscale         | --> |  2 background     |
+|  iTrade-<SKU>.<ext>       |     |  Real-ESRGAN x2    |     |  BiRefNet matte   |
+|  (raw inputs)             |     |  (GPU)             |     |  (transparent)    |
++---------------------------+     +--------------------+     +------------------+
+                                                                     |
+                                                                     v
++---------------------------+     +--------------------+     +------------------+
+|  4 Shopify                | <-- |  3 normalize       | <-- |  2 background     |
+|  product variant images   |     |  1600x1600 WEBP    |     |  BiRefNet matte   |
+|  (replaced per SKU)       |     |  transparent, even |     |                  |
++---------------------------+     |  margin            |     +------------------+
+                                  +--------------------+
 
-1. **Run pass 1** to upscale, censor brand text, and cut the background.
-   ```bash
-   docker compose run --rm pipeline process_images.py
-   ```
-2. **Review `./output/`** -- open the PNGs and check the result.
-3. **Approve** (push the output back to the brand folders as the new originals).
-   ```bash
-   docker compose run --rm pipeline approve_output.py --clear-after
-   ```
-4. **(Optional) Mark leftovers** with magenta `#ff00bf` in any image that
-   still has OCR-missed marks, then run pass 2.
-   ```bash
-   docker compose run --rm pipeline remove_magenta.py
-   docker compose run --rm pipeline approve_output.py --clear-after
-   ```
-5. **Run pass 3** to compose the final 1200x1200 canvases.
-   ```bash
-   docker compose run --rm pipeline normalize_watches.py
-   ```
-6. **Upload to Shopify** (reads from `./output/` directly) or approve first
-   to archive in the brand folders.
-   ```bash
-   docker compose run --rm pipeline shopify_auth.py --dry-run
-   docker compose run --rm pipeline shopify_auth.py
-   ```
+  0.5 preflight runs before anything else and stops the run when the store
+  and the local images disagree.
+```
 
-If you don't like a pass's output, just re-run the same script -- it will
-empty `./output/` and start fresh.
+### 0.5 Preflight
 
-## Hardware
+Counts the Shopify products and variants against the local images and refuses
+to continue on any gap:
 
-- NVIDIA GPU with at least **6 GB VRAM** (RTX 3050 6 GB works).
-- ~10 GB disk for the Docker image (PyTorch + models pre-baked).
-- ~20 GB more for build cache if you rebuild from scratch.
+- a variant SKU with no `iTrade-<SKU>` file -> **stop**
+- a local file whose SKU is not in the store -> **stop**
+
+Both lists are printed before the run ends, so nothing is uploaded half done.
+
+### 1 Upscale
+
+Real-ESRGAN x2 on the GPU. The extra resolution is what the final canvas is
+built on.
+
+### 2 Background removal
+
+BiRefNet (`birefnet-general`) writes a soft alpha matte. The matte is what
+keeps the edges clean: no halo, no fringe, no hard cut. The transition band
+of the matte is then tightened so the edge stays crisp at 1600 px.
+
+BiRefNet needs about 6 GB of VRAM, which is more than a 6 GB card has left
+once the upscaler is loaded. The pipeline therefore runs the matte on the GPU
+when there is room and falls back to the CPU automatically when the GPU
+cannot hold it (about 20 s per image on the CPU).
+
+Internally the matte is computed first and cached as an alpha PNG under
+`./output/.cache/matte/`, then the cutout is upscaled. That keeps the two GPU
+models from competing for VRAM and lets a re-run skip the work already done.
+
+### 3 Normalization
+
+Pure geometry, no AI. The framing rule is the same for every image, which is
+what keeps the gallery steady when the customer clicks through it:
+
+1. measure the watch on its own alpha mask
+2. crop a square centred on that mask
+3. scale it so its longest side always spans the same usable area
+4. centre it on a 1600x1600 transparent canvas
+
+The margin is therefore identical on all four sides of every image, and the
+subject keeps the same size and the same position from one photo to the next.
+Output is WEBP with alpha, quality 90, which Shopify accepts as-is and serves
+with its own responsive sizes.
+
+### 4 Publish
+
+For every product that matches a local SKU:
+
+1. upload the new image (staged upload) and wait until Shopify reports it
+   `READY`
+2. detach the media the variant was using
+3. point the variant at the new media
+4. delete the replaced media
+
+Media that does not belong to a SKU is never touched.
 
 ## Setup
 
-```bash
-# Build the image (downloads AI weights at build time)
-docker compose build
-
-# Pass 1: AI stages (upscale + inpaint + bg-cut)
-docker compose run --rm pipeline process_images.py
-
-# Verbose trace + mask overlay (saves ./output/.debug_mask_overlay.png)
-docker compose run --rm -e VERBOSE_LOG=1 pipeline process_images.py
-
-# Pass 2: remove manually-marked magenta regions (optional)
-docker compose run --rm pipeline remove_magenta.py
-
-# Pass 3: geometric normalization (size + margins, no AI)
-docker compose run --rm pipeline normalize_watches.py
-
-# Promote output -> input when satisfied
-docker compose run --rm pipeline approve_output.py --clear-after
-
-# Shopify upload (reads from ./output/)
-docker compose run --rm pipeline shopify_auth.py --dry-run
-docker compose run --rm pipeline shopify_auth.py
-```
-
-The pipeline is fully self-contained: scripts are bind-mounted into the
-container (`process_images.py`, `normalize_watches.py`, `remove_magenta.py`,
-`approve_output.py`, `shopify_auth.py`) so edits take effect on the next run
-without rebuilding the image.
-
-## Image requirements
-
-- **Naming**: `iTrade-<SKU>.<ext>` -- SKU becomes the filename stem.
-- **Format**: JPEG, PNG, or WebP (any size; 1080x1200+ recommended).
-- **Subject**: watch centred on plain background. The OCR relies on the
-  bezel + dial being visible at the top of the image.
-- **Output**: `./output/<BrandFolder>/` -- whatever the last script wrote
-  (transparent watches post-AI, or 1200x1200 composed canvases after
-  `normalize_watches.py`). Well under Shopify's 20 MB per-image limit
-  (typical 1200x1200 PNG is ~700 KB).
-- **Pass-2 marker colour**: paint leftovers with exact `#ff00bf`
-  (R=255, G=0, B=191). Don't anti-alias the fill -- `remove_magenta.py`
-  tolerates a small fringe but a clean fill produces the tightest mask.
-
-## Uploading to Shopify
-
-`shopify_auth.py` reads SKUs from `./output/<BrandFolder>/iTrade-<SKU>.png`
-(the result of `normalize_watches.py`), matches them to Shopify product
-variants, uploads the missing images via the staged upload API, and
-associates each one with its variant.
+Requirements: Docker with the NVIDIA container toolkit, an NVIDIA GPU with
+6 GB VRAM, and the Shopify CLI on the host for the one-time login.
 
 ```bash
-# Prerequisites (one-time setup)
+# one time, on the host: opens the browser and stores the session
 shopify store auth --store axuzmh-jz.myshopify.com \
     --scopes "read_products,write_products,read_inventory,write_inventory,read_locations"
 
-# After auth, the CLI saves the access token to a per-store config file:
-cat ~/.config/shopify-cli-store-nodejs/config.json
+# build the image (model weights are baked in at build time)
+docker compose build
 
-# Dry run: print matches only
-docker compose run --rm pipeline shopify_auth.py --dry-run
-
-# Upload and associate
-docker compose run --rm pipeline shopify_auth.py
+# run the whole flow
+docker compose run --rm pipeline
 ```
 
-The Shopify access token is hardcoded in `shopify_auth.py` -- rotate it
-before publishing and paste the new value from `shopify store auth`.
+The Shopify CLI writes the session to
+`~/.config/shopify-cli-store-nodejs/config.json`. The compose file mounts that
+directory read-only into the container, and the pipeline reads the token from
+it. Nothing is written to the host except the images in `./output/`, and
+nothing is left installed on the host: no Python packages, no virtualenv, no
+model weights.
 
-## Configuration knobs
+If the token is missing or expired the run stops immediately and prints the
+command to fix it.
 
-### `process_images.py` (AI stages)
+To hand the container less than the whole CLI folder, point it at a folder
+that holds only the session you want to use:
 
-| Constant | Default | What it controls |
+```bash
+mkdir -p ~/.config/shopify-session
+jq 'to_entries[0].value.sessionsByUserId | to_entries[0].value
+    | {store, accessToken, scopes, expiresAt}' \
+    ~/.config/shopify-cli-store-nodejs/config.json > ~/.config/shopify-session/config.json
+SHOPIFY_CLI_CONFIG_DIR=~/.config/shopify-session docker compose run --rm pipeline
+```
+
+## Useful flags
+
+```bash
+docker compose run --rm pipeline --dry-run   # preflight counts only, touches nothing
+docker compose run --rm pipeline --force     # reprocess images that already have an output
+docker compose run --rm pipeline --limit 5   # process the first 5 images only
+```
+
+## Utilities
+
+Two helpers that do not belong to the image flow live next to it:
+
+```bash
+docker compose run --rm --entrypoint python pipeline shopify_metafields.py --dry-run
+docker compose run --rm --entrypoint python pipeline shopify_strip_tags.py --dry-run
+```
+
+## Configuration
+
+Every knob is an environment variable set in `docker-compose.yml`.
+
+| Variable | Default | What it controls |
 |---|---|---|
-| `STAGE_BG_ENABLED` | `True` | Run BiRefNet background removal |
-| `STAGE_BG_MODEL` | `birefnet-general` | rembg session name |
-| `STAGE_UPSCALE_ENABLED` | `True` | Run Real-ESRGAN upscale |
-| `STAGE_UPSCALE_MODEL` | `RealESRGAN_x2plus.pth` | Real-ESRGAN weight file |
-| `STAGE_UPSCALE_OUTSCALE` | `2` | Output = input x this |
-| `STAGE_UPSCALE_TILE` | `512` | Tile size for VRAM control (0 = no tiling, OOM-prone) |
-| `STAGE_INPAINT_ENABLED` | `True` | Run OCR + LaMa inpaint |
-| `STAGE_OCR_KEYWORDS` | `["SEIKO", ...]` | Brand text to remove (fuzzy-matched) |
-| `STAGE_OCR_CONFIDENCE` | `0.6` | OCR confidence floor |
-| `STAGE_MASK_FEATHER_PX` | `11` | Gaussian blur on the inpaint mask edges |
-| `LAMA_MAX_DIM` | `1280` | Downscale before LaMa on big images (6 GB VRAM safety) |
-| `IMAGE_LIMIT` | `None` | Stop after this many images (debug aid) |
-| `VERBOSE_LOG` | `0` | Set to `1` for per-image trace + mask overlay |
+| `CANVAS_SIZE` | `1600` | Final square canvas edge length |
+| `PADDING_RATIO` | `0.08` | Empty margin as a share of the canvas |
+| `UPSCALE_SCALE` | `2` | Real-ESRGAN factor |
+| `UPSCALE_TILE` | `512` | Tile size for VRAM control (0 = no tiling, OOM prone) |
+| `STAGE_BG_MODEL` | `birefnet-general` | rembg session name (`birefnet-general-lite` runs on the GPU) |
+| `ALPHA_LOW` | `64` | Alpha below this counts as background |
+| `ALPHA_HIGH` | `192` | Alpha above this counts as subject, the band in between is the soft edge |
+| `ALPHA_THRESHOLD` | `128` | Alpha level that counts as subject |
+| `COMPONENT_RATIO` | `0.15` | Smaller shapes kept next to the main one |
+| `WEBP_QUALITY` | `90` | WEBP quality |
+| `WEBP_METHOD` | `6` | WEBP encoder effort (0 fastest, 6 smallest) |
+| `SHOPIFY_STORE` | `axuzmh-jz.myshopify.com` | Target store |
+| `SHOPIFY_CLI_CONFIG_DIR` | `~/.config/shopify-cli-store-nodejs` | Where the CLI session lives |
 
-### `normalize_watches.py` (geometric normalization)
+## Image requirements
 
-| Constant | Default | What it controls |
-|---|---|---|
-| `TARGET_SIZE` | `1200` | Final square canvas edge length |
-| `PADDING` | `80` | Pixels of empty space around the watch bbox |
-| `BACKGROUND` | `None` | `None` = transparent PNG; tuple/`"#hex"` = opaque fill |
-| `OUTPUT_FORMAT` | `PNG` | `PNG` (transparent-safe) or `JPEG` (needs opaque bg) |
-| `JPEG_QUALITY` | `95` | JPEG quality when `OUTPUT_FORMAT = "JPEG"` |
-| `ALPHA_THRESHOLD` | `128` | Cutout alpha threshold for bbox detection |
-| `ALPHA_DILATE_SIZE` | `5` | Max-filter on alpha before bbox (tightens edge) |
-| `ALPHA_SMOOTH_RADIUS` | `1.2` | Gaussian blur on alpha before bbox |
-| `SHARPEN_PERCENT` | `0` | Unsharp mask strength; `0` = off (watch pixels untouched) |
-| `OVERWRITE` | `False` | (legacy -- OUTPUT_DIR is cleared at start anyway) |
-| `IMAGE_LIMIT` | `None` | Stop after this many images (debug aid) |
-| `VERBOSE_LOG` | `0` | Set to `1` for per-image trace |
+- **Naming**: `iTrade-<SKU>.<ext>` -- the SKU becomes the filename stem and
+  is what the pipeline matches against the store.
+- **Format**: JPEG, PNG or WebP. Sources are usually around 1200 px.
+- **Subject**: the watch centred on a plain background.
 
 ## Project layout
 
 ```
 .
-├── Dockerfile                # Pytorch base + rembg/easyocr/simplelama/realesrgan
-├── docker-compose.yml        # GPU passthrough, bind-mounts, env
-├── LICENSE                    # MIT
-├── README.md                  # you are here
-├── process_images.py          # pass 1: upscale + OCR-inpaint + bg-cut (AI only)
-├── remove_magenta.py          # pass 2: detect #ff00bf marks + LaMa inpaint
-├── normalize_watches.py       # pass 3: symmetric crop + scale + compose (no AI)
-├── approve_output.py          # promote ./output/ back to ./<BrandFolder>/
-├── shopify_auth.py            # Shopify uploader (reads from ./output/)
-├── .dockerignore              # excludes cache/output/etc from build context
-├── .gitignore                 # excludes cache/output/credentials/etc
-├── <BrandFolder>/             # input images (e.g. GMT/, Royal Oak/, ...)
-└── output/                    # shared output folder (each script clears it on start;
-                               # .cache/ survives for resume)
+├── Dockerfile                # torch + rembg + realesrgan, weights baked in
+├── docker-compose.yml        # GPU passthrough, bind mounts, env
+├── pipeline.py               # the one command: preflight, upscale, matte, normalize, publish
+├── shopify_api.py            # Shopify client: token, queries, staged upload, media replace
+├── shopify_metafields.py     # utility: assigns custom.sale_count
+├── shopify_strip_tags.py     # utility: strips `coleccion:` tags
+├── <BrandFolder>/            # input images (GMT/, Royal Oak/, ...)
+└── output/                   # results, one WEBP per input image
 ```
 
 ## License

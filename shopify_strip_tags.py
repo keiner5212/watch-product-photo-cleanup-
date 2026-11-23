@@ -7,8 +7,8 @@ is over -- strip those tags without touching anything else. Non-matching
 tags are preserved as-is. Products whose only tag was the target tag end
 up with an empty tag list.
 
-The Shopify access token is shared with shopify_auth.py - paste it there
-once and this script picks it up.
+The Shopify access token comes from the Shopify CLI session on the host, the
+same one the image pipeline uses.
 
 Usage
 -----
@@ -18,7 +18,7 @@ Usage
 import argparse
 import sys
 
-from shopify_auth import _raise_user_errors, graphql, load_token
+from shopify_api import graphql, load_token, raise_user_errors
 
 TAG_PREFIX = "coleccion:"
 
@@ -92,7 +92,7 @@ def report_plan(plans):
 def strip_tags(token, product_id, new_tags):
     variables = {"input": {"id": product_id, "tags": new_tags}}
     payload = graphql(token, PRODUCT_UPDATE_MUTATION, variables)["productUpdate"]
-    _raise_user_errors("product tag update", payload["userErrors"])
+    raise_user_errors("product tag update", payload["userErrors"])
 
 
 def apply_strips(token, plans):

@@ -1,64 +1,61 @@
 # syntax=docker/dockerfile:1.7
-# Watch image pipeline.
+# Watch image pipeline: one command, GPU upscale + background removal + Shopify upload.
 #
-# Why pytorch/pytorch:2.7.0-cuda12.4-cudnn-runtime as base, not
-# nvidia/cuda or python:3.11-slim-bookworm:
-#   - torch + torchvision already installed (PyTorch's own build, ~8 GB
-#     base image). No `pip install torch==2.5.0+cu124` at build time, so
-#     no ENOSPC error on /tmp extracting 2 GB wheels.
-#   - The image is regenerated periodically by PyTorch team, so apt keys
-#     are usually fresh and no GPG signature mismatch on apt update.
-#   - Smaller build steps above the base: just ~500 MB of AI deps.
+# Base: pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime
+#   torch + CUDA are already installed (no torch wheel download at build time).
+#   The nvidia CUDA runtime libs live in site-packages/nvidia/<lib>/lib, so they
+#   are registered with ldconfig for onnxruntime-gpu (BiRefNet) to load its
+#   CUDA execution provider.
+#
 # Host prereqs:
-#   - NVIDIA driver (535.x or newer recommended for CUDA 12.4+)
+#   - NVIDIA driver (535.x or newer for CUDA 12.6)
 #   - nvidia-container-toolkit
 
-FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime
+FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime@sha256:27c3135420bc184e86977170b6158c6133be3c7cc5c35e9e4fa87bdda629dc2b
 
-# pytorch/pytorch base images use Ubuntu 22.04 as underlying. apt keys
-# typically valid, but use --allow-unauthenticated as defense for any
-# rotated repos.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    # Pre-baked AI weights land in image filesystem.
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
     XDG_CACHE_HOME=/root/.cache \
     HF_HOME=/root/.cache/huggingface \
     HOME=/root
 
-# OS deps in one layer. pytorch/pytorch:2.7.0 minimal base has no
-# wget/curl, so install curl first.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update -o Acquire::AllowInsecureRepositories=true && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        curl ca-certificates \
-        git \
-        libgl1 libglib2.0-0 \
-        libsm6 libxrender1 libxext6 && \
+    curl ca-certificates \
+    libgl1 libglib2.0-0 \
+    libsm6 libxrender1 libxext6 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# All AI deps with NORMAL dep resolution (no --no-deps).
-# pip handles transitive deps automatically — no more manual ModuleNotFoundError.
-#
-# rembg installs with cpu onnxruntime (not [gpu]).  Stage 1 bg-cut
-# runs on CPU (~20 s/image).  Stages 2-4 stay GPU via torch.
-# Dropped: paddlepaddle / paddleocr (CRAFT detection is more
-# accurate than PaddleOCR's DB for thin serif on dark dials),
-# onnxruntime-gpu (cuBLAS11 version chaos), nvidia-cublas-cu11
-# pip wheels (LD_LIBRARY_PATH never resolved correctly).
+# onnxruntime-gpu ships both the CUDA and the CPU execution provider, so the
+# pipeline still runs (slower) when no GPU is visible to the container.
+# rembg pulls the CPU-only onnxruntime wheel, so it is removed before the GPU
+# wheel is installed to keep one single onnxruntime package on the image.
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip install --no-cache-dir \
-        "rembg[cpu]==2.0.77" \
-        "easyocr>=1.7" \
-        "simple-lama-inpainting==0.1.0" \
-        "opencv-python-headless<5.0,>=4.10" \
-        "facexlib" \
-        "gfpgan" \
-        "realesrgan==0.3.0"
+    "rembg==2.0.77" \
+    "realesrgan==0.3.0" \
+    "opencv-python-headless>=4.10,<5.0" && \
+    pip uninstall -y onnxruntime || true
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install --no-cache-dir \
+    flatbuffers protobuf coloredlogs psutil && \
+    pip install --no-cache-dir --no-deps "onnxruntime-gpu==1.20.0" && \
+    python -c "import onnxruntime as ort; print('onnxruntime', ort.__version__, ort.get_available_providers())"
+
+# Make the pip-installed CUDA libs discoverable by the dynamic linker.
+# onnxruntime-gpu loads libcudart, libcudnn and libcublas at runtime, and this
+# image keeps them under site-packages/nvidia/<lib>/lib.
+RUN SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
+    for dir in "$SITE"/nvidia/*/lib; do echo "$dir"; done \
+    > /etc/ld.so.conf.d/zz-nvidia-pip.conf && \
+    ldconfig && \
+    ldconfig -p | grep -q libcudart.so.12
 
 # basicsr's PyPI sdist is broken on Python 3.11+. Patch get_version().
 RUN cat > /tmp/patch_basicsr.py <<'PATCH_EOF'
@@ -92,30 +89,23 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 # torchvision path-moved: rgb_to_grayscale is in functional, not functional_tensor.
 RUN SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
     sed -i "s|from torchvision.transforms.functional_tensor import rgb_to_grayscale|from torchvision.transforms.functional import rgb_to_grayscale|" \
-        "$SITE/basicsr/data/degradations.py"
+    "$SITE/basicsr/data/degradations.py"
 
-# Pre-bake AI weights into image filesystem. No GPU exposed at build, so
-# model init might fail; downloads still get cached for first run.
-RUN mkdir -p /root/.cache/realesrgan && \
+# Pre-bake model weights into the image filesystem, checksummed.
+RUN mkdir -p /root/.cache/realesrgan /root/.u2net && \
     curl -fsSL -o /root/.cache/realesrgan/RealESRGAN_x2plus.pth \
-        https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth && \
-    cat > /tmp/prebake.py <<'PREBAKE_EOF'
-def step(name, fn):
-    try:
-        print('pre-baking ' + name + '...')
-        fn()
-        print('  ok')
-    except BaseException as e:
-        print('  WARN ' + name + ' failed: ' + type(e).__name__ + ': ' + str(e)[:200])
+    https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth && \
+    echo "49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb  /root/.cache/realesrgan/RealESRGAN_x2plus.pth" \
+    | sha256sum -c - && \
+    curl -fsSL -o /root/.u2net/birefnet-general.onnx \
+    https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-epoch_244.onnx && \
+    echo "58f621f00f5d756097615970a88a791584600dcf7c45b18a0a6267535a1ebd3c  /root/.u2net/birefnet-general.onnx" \
+    | sha256sum -c -
 
-step('rembg BiRefNet', lambda: __import__('rembg').new_session('birefnet-general'))
-step('EasyOCR English', lambda: __import__('easyocr').Reader(['en'], gpu=False, model_storage_directory='/root/.cache/EasyOCR', user_network_directory='/root/.cache/EasyOCR', download_enabled=True, detector=True, recognizer=True))
-step('Big-LaMa', lambda: __import__('simple_lama_inpainting').SimpleLama())
-print('pre-bake complete (warnings are non-fatal; downloads retry on first docker run)')
-PREBAKE_EOF
-RUN python3 /tmp/prebake.py && rm /tmp/prebake.py
+# The CUDA execution provider crashes when no GPU is visible, so the pre-bake
+# session is built on the CPU provider.
+RUN python3 -c "import rembg; rembg.new_session('birefnet-general', providers=['CPUExecutionProvider']); print('pre-bake ok')"
 
-# Bundle ALL Python scripts so any can be run inside the container.
 COPY *.py ./
 
 RUN mkdir -p /data/in /data/out
@@ -124,9 +114,4 @@ ENV WATCH_INPUT_DIR=/data/in \
     WATCH_OUTPUT_DIR=/data/out \
     STAGE_BG_MODEL=birefnet-general
 
-# Default runs process_images.py. Override for any other python:
-#   docker compose run --rm pipeline shopify_auth.py
-#   docker compose run --rm pipeline update_stock.py
-#   docker compose run --rm pipeline bash
-ENTRYPOINT ["python"]
-CMD ["process_images.py"]
+ENTRYPOINT ["python", "-m", "pipeline"]

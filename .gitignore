@@ -1,6 +1,9 @@
 # Generated outputs
 /output/
 
+# Scratch scripts and logs
+/.tmp/
+
 # AI pipeline intermediates (created at runtime)
 /.cache/
 
@@ -22,3 +25,8 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+*.png
+*.webp
+*.jpg
+*.jpeg

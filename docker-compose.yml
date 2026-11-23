@@ -1,50 +1,36 @@
 name: watch-pipeline
 
 services:
-  pipeline:
-    # Build the image from the local Dockerfile. `image:` pins the tag so
-    # `docker compose run` can reference it without rebuilding every time.
-    build: .
-    image: watch-pipeline:latest
-    container_name: watch-pipeline
-    restart: "no"
+    pipeline:
+        build: .
+        image: watch-pipeline:latest
+        restart: "no"
 
-    # Modern Compose (v2.20+): the deploy stanza auto-translates to --gpus on
-    # the underlying `docker run`. Replace with `runtime: nvidia` for older
-    # Compose (<2.20) if the deploy stanza is rejected as unknown.
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu, compute, utility]
-    # runtime: nvidia
+        # Modern Compose (v2.20+): the deploy stanza auto-translates to --gpus on
+        # the underlying `docker run`. Replace with `runtime: nvidia` for older
+        # Compose (<2.20) if the deploy stanza is rejected as unknown.
+        deploy:
+            resources:
+                reservations:
+                    devices:
+                        - driver: nvidia
+                          count: 1
+                          capabilities: [gpu, compute, utility]
+        # runtime: nvidia
 
-    environment:
-      # All AI model weights are pre-baked into the image at build time;
-      # no volumes or external caches are needed.
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      WATCH_INPUT_DIR: /data/in
-      WATCH_OUTPUT_DIR: /data/out
-      # Reduces CUDA memory fragmentation -- prevents OOM on long batches.
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+        environment:
+            # All model weights are pre-baked into the image at build time.
+            NVIDIA_VISIBLE_DEVICES: all
+            NVIDIA_DRIVER_CAPABILITIES: compute,utility
+            WATCH_INPUT_DIR: /data/in
+            WATCH_OUTPUT_DIR: /data/out
+            # Reduces CUDA memory fragmentation -- prevents OOM on long batches.
+            PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
 
-    volumes:
-      # Mount project root as input (read-only); ./output as the result dir.
-      - ./:/data/in:ro
-      - ./output:/data/out
-      # Live-reload: bind-mount the Python scripts into /app so edits
-      # on the host take effect on the next `docker compose run` without
-      # needing a rebuild. Read-only so the container can't write them.
-      - ./process_images.py:/app/process_images.py:ro
-      - ./normalize_watches.py:/app/normalize_watches.py:ro
-      - ./remove_magenta.py:/app/remove_magenta.py:ro
-      - ./approve_output.py:/app/approve_output.py:ro
-      - ./shopify_auth.py:/app/shopify_auth.py:ro
-      - ./shopify_metafields.py:/app/shopify_metafields.py:ro
-      - ./shopify_strip_tags.py:/app/shopify_strip_tags.py:ro
-      # update_stock.py is missing from the repo — re-add this line once
-      # the file is restored:
-      # - ./update_stock.py:/app/update_stock.py:ro
+        volumes:
+            # Project root as input (read-only), results land in ./output.
+            - ./:/data/in:ro
+            - ./output:/data/out
+            # The Shopify CLI session written on the host, read-only. The container
+            # reads the admin API token from it and never writes to it.
+            - ${SHOPIFY_CLI_CONFIG_DIR:-${HOME}/.config/shopify-cli-store-nodejs}:/data/shopify-cli:ro

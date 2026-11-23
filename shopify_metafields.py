@@ -5,8 +5,8 @@ Products in the "Mejor Vendidos" collection get a random value in
 COLLECTION_RANGE; every other product gets a random value in DEFAULT_RANGE.
 Products that already have sale_count are skipped (idempotent re-runs).
 
-The Shopify access token is shared with shopify_auth.py - paste it there once
-and both scripts pick it up.
+The Shopify access token comes from the Shopify CLI session on the host, the
+same one the image pipeline uses.
 
 Usage
 -----
@@ -17,7 +17,7 @@ import argparse
 import random
 import sys
 
-from shopify_auth import _raise_user_errors, graphql, load_token
+from shopify_api import graphql, load_token, raise_user_errors
 
 NAMESPACE = "custom"
 KEY = "sale_count"
@@ -103,7 +103,7 @@ def assign_sale_count(token, product_id, value):
         ]
     }
     payload = graphql(token, METAFIELDS_SET_MUTATION, variables)["metafieldsSet"]
-    _raise_user_errors("metafield set", payload["userErrors"])
+    raise_user_errors("metafield set", payload["userErrors"])
 
 
 def plan_assignments(products, collection_ids):
